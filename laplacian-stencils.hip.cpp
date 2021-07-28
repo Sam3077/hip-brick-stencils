@@ -1,19 +1,53 @@
 #include <iostream>
 
-#include "bricksetup.h"
-#include "multiarray.h"
-#include "brickcompare.h"
 #include <omp.h>
 #include <cmath>
 #include <cassert>
 
-__host__ void runNaiveTest(bool verify, bElem* arr_a, bElem *expected);
-__host__ void runLargeBrickTest(bool verify, bElem *arr_a, bElem *expected);
-__host__ void runNaiveArrayTest(bool verify, bElem *arr_a, bElem *expected);
-
+#ifndef NO_BRICK
+#include "bricksetup.h"
+#include "multiarray.h"
+#include "brickcompare.h"
 #include <brick-hip.h>
 #include "vecscatter.h"
 #include "brick.h"
+#else
+
+#include <random>
+#include <vector>
+#include <hip/hip_runtime.h>
+#define bElem double
+bElem *randomArray(const std::vector<long> &list) {
+  long size;
+  size = 1;
+  for (auto i: list)
+    size *= i;
+
+  bElem *arr = (bElem *) malloc(size * sizeof(bElem));
+  std::random_device r;
+  auto mt = new std::mt19937_64(r());
+  auto u = new std::uniform_real_distribution<bElem>(0, 1);
+
+#pragma omp parallel for
+  for (long l = 0; l < size; ++l)
+    arr[l] = (*u)(*mt);
+  return arr;
+}
+
+bElem *zeroArray(const std::vector<long> &list) {
+  long size; 
+  size = 1;
+  for (auto i: list)
+    size *= i;
+
+  bElem *arr = (bElem *) malloc(size * sizeof(bElem));
+#pragma omp parallel for
+  for (long l = 0; l < size; ++l)
+    arr[l] = 0.0;
+  return arr;
+}
+
+#endif
 
 #define N 512
 #define OFF (GZ + PADDING)
@@ -32,15 +66,11 @@ __host__ void runNaiveArrayTest(bool verify, bElem *arr_a, bElem *expected);
 
 #define BRICK_SIZE TILE, TILE, TILE
 
+#ifndef NO_BRICK
 #define BType Brick<Dim<BRICK_SIZE>, Dim<FOLD>>
+#endif
 
 #define hipSynchronizeAssert(e) assert(hipDeviceSynchronize() == hipSuccess)
-
-#ifdef NO_VERIFY
-#define VERIFY false
-#else
-#define VERIFY true
-#endif
 
 __constant__ bElem dev_coeff[10];
 
@@ -89,6 +119,8 @@ __global__ void naive_49pt_sum(bElem (*in)[STRIDE][STRIDE], bElem (*out)[STRIDE]
     return naive_xpt_sum(in, out, 8);
 }
 
+#ifndef NO_BRICK
+
 __device__ void naive_brick_xpt(unsigned (*grid)[NAIVE_BSTRIDE][NAIVE_BSTRIDE], BType &bIn, BType &bOut, size_t radius) {
     unsigned b = grid[hipBlockIdx_z + GB][hipBlockIdx_y + GB][hipBlockIdx_x + GB];
     unsigned i = hipThreadIdx_x + (hipBlockIdx_x) * TILE;
@@ -131,6 +163,7 @@ __global__ void brick_gen49(unsigned (*grid)[NAIVE_BSTRIDE][NAIVE_BSTRIDE], BTyp
     unsigned b = grid[hipBlockIdx_z + GB][hipBlockIdx_y + GB][hipBlockIdx_x + GB];
     brick("49pt.py", VSVEC, (TILE, TILE, TILE), (FOLD), b);
 }
+#endif
 
 #define THRESH 0.001
 __host__ void check_gpu_answer(bElem (*expected)[STRIDE][STRIDE], bElem *dev_solution, const char *error_message) {
@@ -152,6 +185,7 @@ __host__ void check_gpu_answer(bElem (*expected)[STRIDE][STRIDE], bElem *dev_sol
     free(solution);
 }
 
+#ifndef NO_BRICK
 __host__ void check_device_brick(bElem (*expected)[STRIDE][STRIDE], BrickStorage device_bstorage, BrickInfo<3> *binfo, unsigned brick_size, unsigned *bgrid, const char *error_message) {
     auto brick_storage = movBrickStorage(device_bstorage, hipMemcpyDeviceToHost);
     BType bOut(binfo, brick_storage, brick_size);
@@ -187,6 +221,8 @@ __global__ void codegen_tile49(bElem (*arr_in)[STRIDE][STRIDE], bElem (*arr_out)
 #undef bIn
 #undef bOut
 
+#endif
+
 int main(void) {
     bElem coeff[] = {1.0, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1};
     hipMemcpyToSymbol((bElem *) dev_coeff, (bElem *) coeff, 10 * sizeof(bElem), hipMemcpyDeviceToHost);
@@ -207,46 +243,47 @@ int main(void) {
 
     // ---- GENERATE KNOWN SOLUTION ----
     printf("Generating expected\n");
-    if (VERIFY) {
-        auto expected = (bElem (*)[STRIDE][STRIDE]) malloc(STRIDE * STRIDE * STRIDE * sizeof(bElem));
-        {
-            bElem *dev_gpu_b;
-            hipMalloc(&dev_gpu_b, STRIDE * STRIDE * STRIDE * sizeof(bElem));
-            hipLaunchKernelGGL(no_prof_single_thread_xpt, 1, 1, 0, 0, dev_a, dev_gpu_b, 2);
-            hipDeviceSynchronize();
+    #ifndef NO_VERIFY
+    auto expected = (bElem (*)[STRIDE][STRIDE]) malloc(STRIDE * STRIDE * STRIDE * sizeof(bElem));
+    {
+        bElem *dev_gpu_b;
+        hipMalloc(&dev_gpu_b, STRIDE * STRIDE * STRIDE * sizeof(bElem));
+        hipLaunchKernelGGL(no_prof_single_thread_xpt, 1, 1, 0, 0, dev_a, dev_gpu_b, 2);
+        hipDeviceSynchronize();
 
-            hipMemcpy((bElem *) expected, dev_gpu_b, STRIDE * STRIDE * STRIDE * sizeof(bElem), hipMemcpyDeviceToHost);
-            hipFree(dev_gpu_b);
-        }
-
-        printf("Generating expected49\n");
-        auto expected49 = (bElem (*)[STRIDE][STRIDE]) malloc(STRIDE * STRIDE * STRIDE * sizeof(bElem));
-        {
-            bElem *dev_gpu_b;
-            hipMalloc(&dev_gpu_b, STRIDE * STRIDE * STRIDE * sizeof(bElem));
-            hipLaunchKernelGGL(no_prof_single_thread_xpt, 1, 1, 0, 0, dev_a, dev_gpu_b, 8);
-            hipDeviceSynchronize();
-
-            hipMemcpy((bElem *) expected, dev_gpu_b, STRIDE * STRIDE * STRIDE * sizeof(bElem), hipMemcpyDeviceToHost);
-            hipFree(dev_gpu_b);
-        }
-
-        printf("Generating expected 31\n");
-        auto expected31 = (bElem (*)[STRIDE][STRIDE]) malloc(STRIDE * STRIDE * STRIDE * sizeof(bElem));
-        {
-            bElem *dev_gpu_b;
-            hipMalloc(&dev_gpu_b, STRIDE * STRIDE * STRIDE * sizeof(bElem));
-            hipLaunchKernelGGL(no_prof_single_thread_xpt, 1, 1, 0, 0, dev_a, dev_gpu_b, 5);
-            hipDeviceSynchronize();
-
-            hipMemcpy((bElem *) expected, dev_gpu_b, STRIDE * STRIDE * STRIDE * sizeof(bElem), hipMemcpyDeviceToHost);
-            hipFree(dev_gpu_b);
-        }
+        hipMemcpy((bElem *) expected, dev_gpu_b, STRIDE * STRIDE * STRIDE * sizeof(bElem), hipMemcpyDeviceToHost);
+        hipFree(dev_gpu_b);
     }
+
+    printf("Generating expected49\n");
+    auto expected49 = (bElem (*)[STRIDE][STRIDE]) malloc(STRIDE * STRIDE * STRIDE * sizeof(bElem));
+    {
+        bElem *dev_gpu_b;
+        hipMalloc(&dev_gpu_b, STRIDE * STRIDE * STRIDE * sizeof(bElem));
+        hipLaunchKernelGGL(no_prof_single_thread_xpt, 1, 1, 0, 0, dev_a, dev_gpu_b, 8);
+        hipDeviceSynchronize();
+
+        hipMemcpy((bElem *) expected, dev_gpu_b, STRIDE * STRIDE * STRIDE * sizeof(bElem), hipMemcpyDeviceToHost);
+        hipFree(dev_gpu_b);
+    }
+
+    printf("Generating expected 31\n");
+    auto expected31 = (bElem (*)[STRIDE][STRIDE]) malloc(STRIDE * STRIDE * STRIDE * sizeof(bElem));
+    {
+        bElem *dev_gpu_b;
+        hipMalloc(&dev_gpu_b, STRIDE * STRIDE * STRIDE * sizeof(bElem));
+        hipLaunchKernelGGL(no_prof_single_thread_xpt, 1, 1, 0, 0, dev_a, dev_gpu_b, 5);
+        hipDeviceSynchronize();
+
+        hipMemcpy((bElem *) expected, dev_gpu_b, STRIDE * STRIDE * STRIDE * sizeof(bElem), hipMemcpyDeviceToHost);
+        hipFree(dev_gpu_b);
+    }
+    #endif
     // ---- KNOWN SOLUTION GENERATED ----
 
 
     // ---- BRICK SETUP ----
+    #ifndef NO_BRICK
     unsigned *bgrid;
     auto binfo = init_grid<3>(bgrid, {NAIVE_BSTRIDE, NAIVE_BSTRIDE, NAIVE_BSTRIDE});
     unsigned *device_bgrid;
@@ -274,6 +311,7 @@ int main(void) {
     BrickStorage device_bstorage = movBrickStorage(brick_storage, hipMemcpyHostToDevice);
     bIn = BType(device_binfo, device_bstorage, 0);
     bOut = BType(device_binfo, device_bstorage, brick_size);
+    #endif
     // ---- DONE WITH BRICK SETUP ----
 
     // ---- RUN TESTS ----
@@ -283,76 +321,107 @@ int main(void) {
     printf("Naive Array 13pt\n");
     hipLaunchKernelGGL(naive_13pt_sum, blocks, threads, 0, 0, dev_a, dev_b);
     hipSynchronizeAssert();
-    if (VERIFY) check_gpu_answer(expected, dev_b, "Naive array solution mismatch");
+    #ifndef NO_VERIFY
+    check_gpu_answer(expected, dev_b, "Naive array solution mismatch");
+    #endif
 
     printf("Naive Array 31pt\n");
     hipLaunchKernelGGL(naive_31pt_sum, blocks, threads, 0, 0, (bElem (*)[STRIDE][STRIDE]) dev_a, (bElem (*)[STRIDE][STRIDE]) dev_b);
     hipSynchronizeAssert();
-    if (VERIFY) check_gpu_answer(expected, dev_b, "Naive array solution mismatch");
+    #ifndef NO_VERIFY
+    check_gpu_answer(expected, dev_b, "Naive array solution mismatch");
+    #endif
 
     printf("Naive Array 49pt\n");
     hipLaunchKernelGGL(naive_49pt_sum, blocks, threads, 0, 0, (bElem (*)[STRIDE][STRIDE]) dev_a, (bElem (*)[STRIDE][STRIDE]) dev_b);
     hipSynchronizeAssert();
-    if (VERIFY) check_gpu_answer(expected49, dev_b, "Naive array 49pt solution mismatch");
+    #ifndef NO_VERIFY
+    check_gpu_answer(expected49, dev_b, "Naive array 49pt solution mismatch");
+    #endif
 
+    #ifndef NO_BRICK
     {
         dim3 block(BLOCK, BLOCK, N / 64);
         dim3 thread(64, 1, 1);
         printf("Codegen Tile 13pt\n");
         hipLaunchKernelGGL(codegen_tile, block, thread, 0, 0, (bElem (*)[STRIDE][STRIDE]) dev_a, (bElem (*)[STRIDE][STRIDE]) dev_b);
         hipSynchronizeAssert();
-        if (VERIFY) check_gpu_answer(expected, dev_b, "Codegen tile solution mismatch");
+        #ifndef NO_VERIFY
+        check_gpu_answer(expected, dev_b, "Codegen tile solution mismatch");
+        #endif
 
         printf("Codegen Tile 31pt\n");
         hipLaunchKernelGGL(codegen_tile31, block, thread, 0, 0, (bElem (*)[STRIDE][STRIDE]) dev_a, (bElem (*)[STRIDE][STRIDE]) dev_b);
         hipSynchronizeAssert();
-        if (VERIFY) check_gpu_answer(expected31, dev_b, "Codegen tile solution mismatch");
+        #ifndef NO_VERIFY
+        check_gpu_answer(expected31, dev_b, "Codegen tile solution mismatch");
+        #endif
 
         printf("Codegen Tile 49pt\n");
         hipLaunchKernelGGL(codegen_tile49, block, thread, 0, 0, (bElem (*)[STRIDE][STRIDE]) dev_a, (bElem (*)[STRIDE][STRIDE]) dev_b);
         hipSynchronizeAssert();
-        if (VERIFY) check_gpu_answer(expected49, dev_b, "Codegen tile solution mismatch");
+        #ifndef NO_VERIFY
+        check_gpu_answer(expected49, dev_b, "Codegen tile solution mismatch");
+        #endif
     }
 
     printf("Naive Brick 13pt\n");    
     hipLaunchKernelGGL(naive_brick_13pt, blocks, threads, 0, 0, (unsigned (*)[NAIVE_BSTRIDE][NAIVE_BSTRIDE]) device_bgrid, bIn, bOut);
     hipSynchronizeAssert();
-    if (VERIFY) check_device_brick(expected, device_bstorage, &binfo, brick_size, bgrid, "Naive brick solution mismatch");
+    #ifndef NO_VERIFY
+    check_device_brick(expected, device_bstorage, &binfo, brick_size, bgrid, "Naive brick solution mismatch");
+    #endif
 
     printf("Naive Brick 31pt\n");    
     hipLaunchKernelGGL(naive_brick_31pt, blocks, threads, 0, 0, (unsigned (*)[NAIVE_BSTRIDE][NAIVE_BSTRIDE]) device_bgrid, bIn, bOut);
     hipSynchronizeAssert();
-    if (VERIFY) check_device_brick(expected31, device_bstorage, &binfo, brick_size, bgrid, "Naive brick solution mismatch");
+    #ifndef NO_VERIFY
+    check_device_brick(expected31, device_bstorage, &binfo, brick_size, bgrid, "Naive brick solution mismatch");
+    #endif
 
     printf("Naive Brick 49pt\n");    
     hipLaunchKernelGGL(naive_brick_49pt, blocks, threads, 0, 0, (unsigned (*)[NAIVE_BSTRIDE][NAIVE_BSTRIDE]) device_bgrid, bIn, bOut);
     hipSynchronizeAssert();
-    if (VERIFY) check_device_brick(expected49, device_bstorage, &binfo, brick_size, bgrid, "Naive brick solution mismatch");
+    #ifndef NO_VERIFY
+    check_device_brick(expected49, device_bstorage, &binfo, brick_size, bgrid, "Naive brick solution mismatch");
+    #endif
 
     printf("Brick Gen\n");
     hipLaunchKernelGGL(brick_gen, blocks, 64, 0, 0, (unsigned (*)[NAIVE_BSTRIDE][NAIVE_BSTRIDE]) device_bgrid, bIn, bOut);
     hipSynchronizeAssert();
-    if (VERIFY) check_device_brick(expected, device_bstorage, &binfo, brick_size, bgrid, "Brick gen solution mismatch");
+    #ifndef NO_VERIFY
+    check_device_brick(expected, device_bstorage, &binfo, brick_size, bgrid, "Brick gen solution mismatch");
+    #endif
 
     printf("Brick Gen\n");
     hipLaunchKernelGGL(brick_gen31, blocks, 64, 0, 0, (unsigned (*)[NAIVE_BSTRIDE][NAIVE_BSTRIDE]) device_bgrid, bIn, bOut);
     hipSynchronizeAssert();
-    if (VERIFY) check_device_brick(expected31, device_bstorage, &binfo, brick_size, bgrid, "Brick gen solution mismatch");
+    #ifndef NO_VERIFY
+    check_device_brick(expected31, device_bstorage, &binfo, brick_size, bgrid, "Brick gen solution mismatch");
+    #endif
 
     printf("Brick Gen 49\n");
     hipLaunchKernelGGL(brick_gen49, blocks, 64, 0, 0, (unsigned (*)[NAIVE_BSTRIDE][NAIVE_BSTRIDE]) device_bgrid, bIn, bOut);
     hipSynchronizeAssert();
-    if (VERIFY) check_device_brick(expected49, device_bstorage, &binfo, brick_size, bgrid, "Brick gen solution mismatch");
+    #ifndef NO_VERIFY
+    check_device_brick(expected49, device_bstorage, &binfo, brick_size, bgrid, "Brick gen solution mismatch");
+    #endif
+
+    #endif // NO_BRICK
     // ---- DONE RUNNING TESTS ----
 
 
     // ---- CLEANUP ----
     free(arr_a);
     free(arr_b);
+
+    #ifndef NO_BRICK
     free(bgrid);
     free(binfo.adj);
     hipFree(device_binfo);
     hipFree(device_bgrid);
+    #endif
+
     hipFree(dev_a);
     hipFree(dev_b);
     return 0;
