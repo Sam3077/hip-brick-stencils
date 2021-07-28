@@ -1,0 +1,6 @@
+pmc: FETCH_SIZE WRITE_SIZE SQ_INSTS_SMEM
+pmc: TCC_EA_RDREQ_sum WRITE_REQ_32B
+pmc: SQ_INSTS_VMEM_WR SQ_INSTS_VMEM_RD 
+pmc: TCC_HIT_sum TCC_MISS_sum
+
+kernel: naive_13pt_sum naive_31pt_sum naive_49pt_sum naive_brick_13pt naive_brick_31pt naive_brick_49pt brick_gen brick_gen31 brick_gen49 codegen_tile codegen_tile31 codegen_tile49
