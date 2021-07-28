@@ -1,0 +1,11 @@
+profs/
+*-out.*
+stencils
+*.out
+config.csv
+config.db
+config.json
+config.stats.csv
+config.sysinfo.txt
+core
+results.txt
